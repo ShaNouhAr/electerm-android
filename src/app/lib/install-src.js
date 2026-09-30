@@ -26,6 +26,6 @@ const archMap = {
 }
 
 const arch = os.arch()
-const installSrc = 'electerm-android-' + (archMap[arch] || 'arm64-v8a')
+const installSrc = 'electerm-android-' + (archMap[arch] || 'arm64-v8a') + '.apk'
 
 export default installSrc
