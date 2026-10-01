@@ -19,7 +19,8 @@ import {
   AIchatWithTools,
   AIlistModels,
   getStreamContent,
-  stopStream
+  stopStream,
+  abortAIRequest
 } from './ai.js'
 import {
   listWidgets,
@@ -36,6 +37,7 @@ const globs = {
   AIlistModels,
   getStreamContent,
   stopStream,
+  abortAIRequest,
   encryptAsync,
   decryptAsync,
   showItemInFolder,
@@ -79,7 +81,6 @@ export function runSync (ws, msg) {
     func,
     args = []
   } = msg
-  // console.log('runSync', func, args)
   // Security: only dispatch to functions that are explicitly wired into
   // the globs object as own properties. Checking hasOwnProperty (instead of
   // a hand-maintained name list) means the allowlist can never drift from the

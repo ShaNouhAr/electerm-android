@@ -6,6 +6,7 @@ import * as widgetLocalFileServer from './widget-local-file-server.js'
 import * as widgetLocalFtpServer from './widget-local-ftp-server.js'
 import * as widgetMcpServer from './widget-mcp-server.js'
 import * as widgetRename from './widget-rename.js'
+import * as widgetLog from './instance-log.js'
 
 // Registry maps widget ID → module. Add new widgets here.
 const widgetRegistry = {
@@ -56,12 +57,20 @@ async function runWidget (widgetId, config) {
     return Promise.reject(new Error(`Widget ${widgetId} already has a running instance. Only one instance is allowed.`))
   }
 
-  const instance = widget.widgetRun(config)
+  // The widget reports through this context; it is handed the instance log
+  // before it knows its own instanceId (see instance-log.js createContext).
+  const ctx = widgetLog.createContext()
+  const instance = widget.widgetRun(config, ctx)
   instance.widgetId = widgetId
   runningInstances.set(instance.instanceId, instance)
+  ctx.bind(instance.instanceId)
+
+  const logger = widgetLog.loggerFor(instance.instanceId)
+  logger.log('info', `Starting ${widget.widgetInfo.name} (${widgetId})`)
 
   return instance.start()
     .then((result) => {
+      logger.log('info', result && result.msg ? result.msg : 'Started')
       return {
         instanceId: instance.instanceId,
         widgetId,
@@ -70,6 +79,9 @@ async function runWidget (widgetId, config) {
       }
     })
     .catch((err) => {
+      // kept in the log file on purpose: this is what the user opens the panel
+      // to read when the widget refuses to start
+      logger.log('error', `Failed to start: ${err && err.message ? err.message : err}`)
       runningInstances.delete(instance.instanceId)
       return instance.stop().catch(() => {}).then(() => { throw err })
     })
@@ -82,10 +94,18 @@ function stopWidget (instanceId) {
     return
   }
 
+  const logger = widgetLog.loggerFor(instanceId)
+  logger.log('info', 'Stopping...')
+
   return instance.stop()
     .then(() => {
+      logger.log('info', 'Stopped')
       runningInstances.delete(instanceId)
       return { instanceId, status: 'stopped' }
+    })
+    .catch((err) => {
+      logger.log('error', `Failed to stop: ${err && err.message ? err.message : err}`)
+      throw err
     })
 }
 
@@ -104,6 +124,7 @@ async function runWidgetFunc (instanceId, funcName, ...args) {
     return result
   } catch (error) {
     console.error(`Error executing ${funcName} on widget instance ${instanceId}:`, error)
+    widgetLog.loggerFor(instanceId).log('error', `${funcName} failed: ${error.message}`)
     throw error
   }
 }
