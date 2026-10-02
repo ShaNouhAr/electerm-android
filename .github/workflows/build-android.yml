@@ -1,304 +1,85 @@
-name: Build Android APK
+name: Build Android LAN Gateway APK
 
 on:
   push:
     branches: [ build ]
+  workflow_dispatch:
 
-# GitHub Actions already skips workflows when the commit message contains
-# [skip ci], [ci skip], [no ci], [skip actions], or [actions skip].
-# The job-level `if` below is an explicit, belt-and-suspenders guard.
 jobs:
   build:
-    name: Build electerm Android APK
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]') && !contains(github.event.head_commit.message, '[no ci]') && !contains(github.event.head_commit.message, '[skip actions]') && !contains(github.event.head_commit.message, '[actions skip]') }}
     permissions:
-      contents: write
-
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
-      - name: Set up Java (JDK 21)
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v3
         with:
-          # The action's default `packages` is "tools platform-tools", but Google
-          # removed the legacy `tools` package, so sdkmanager exits 1 with
-          # "Warning: Failed to find package 'tools'"
-          # (https://github.com/android-actions/setup-android/issues/537).
-          # Override it here so only supported packages get installed.
           packages: platform-tools
 
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
+      - name: Install Android SDK
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Install required Android SDK packages
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Install dependencies
+        run: |
+          npm config set legacy-peer-deps true
+          npm i
+          npm --prefix build/android install
 
-      - name: ci init
-        run: npm config set legacy-peer-deps true
-
-      - name: Install root dependencies (electerm + build tooling)
-        run: npm i
-
-      - name: Install Capacitor dependencies
-        run: npm --prefix build/android install
-
-      - name: Build web frontend + Node.js backend bundle
+      - name: Build electerm web/backend for Android
         env:
-          # JWT secret for the on-device electerm server. Baked into the APK
-          # at build time by build/android/build.mjs. Must be set in the
-          # repository GitHub Actions secrets:
-          #   gh secret set SERVER_SECRET --body "$(openssl rand -hex 32)"
-          SERVER_SECRET: ${{ secrets.SERVER_SECRET }}
+          SERVER_SECRET: lan-gateway-ci-build-secret
         run: npm run build:android
 
-      - name: Add Android platform (first run only)
-        run: cd build/android && [ -d android ] || npx cap add android
+      - name: Create and sync Android project
+        run: |
+          cd build/android
+          [ -d android ] || npx cap add android
+          npx cap sync android
 
-      - name: Sync Capacitor (copies web assets + native plugins)
-        run: cd build/android && npx cap sync android
-
-      - name: Ensure nodejs-mobile gradle variable is defined
-        # @capawesome/capacitor-nodejs expects $nodejsMobileVersion to be set.
-        # Append on its own line (variables.gradle has no trailing newline, so a
-        # plain `echo >>` would concatenate onto the closing `}` and break Gradle).
+      - name: Configure Android project
         run: |
           cd build/android/android
-          grep -q "nodejsMobileVersion" variables.gradle || \
-            printf '\next.nodejsMobileVersion = "18.20.4-capawesome.1"\n' >> variables.gradle
-
-      - name: Apply icon / splash overlay
-        run: |
-          # AndroidManifest.xml must go at app/src/main/, NOT inside res/.
-          # Copy the electerm manifest (with icon, theme, network config) to
-          # the correct location, overwriting Capacitor's default.
-          MANIFEST_SRC=build/android/res-overlay/AndroidManifest.xml
-          MANIFEST_DST=build/android/android/app/src/main/AndroidManifest.xml
-          if [ -f "$MANIFEST_SRC" ]; then
-            cp "$MANIFEST_SRC" "$MANIFEST_DST"
-            echo "Overlayed AndroidManifest.xml -> $MANIFEST_DST"
-          fi
-
-          # Custom MainActivity.java: overrides Capacitor's BridgeActivity to
-          # opt out of edge-to-edge (setDecorFitsSystemWindows(true)). Without
-          # this, on Android 15+ (Pixel 9, etc.) the WebView content extends
-          # under the status bar and the tab bar is unclickable. The Java source
-          # lives under res-overlay/java/ and must go to the Gradle source tree
-          # (app/src/main/java/), NOT to res/.
-          JAVA_SRC=build/android/res-overlay/java
-          JAVA_DST=build/android/android/app/src/main/java
-          if [ -d "$JAVA_SRC" ]; then
-            mkdir -p "$JAVA_DST"
-            cp -r "$JAVA_SRC/." "$JAVA_DST/"
-            echo "Overlayed MainActivity.java -> $JAVA_DST"
-          fi
-
-          # Copy all resource dirs (drawable, mipmap-*, values, xml) into res/.
-          # Using overlay/. merges directory contents into the destination
-          # without creating extra nesting levels.
+          grep -q "nodejsMobileVersion" variables.gradle || printf '\next.nodejsMobileVersion = "18.20.4-capawesome.1"\n' >> variables.gradle
+          cd ../../..
+          cp build/android/res-overlay/AndroidManifest.xml build/android/android/app/src/main/AndroidManifest.xml
+          mkdir -p build/android/android/app/src/main/java
+          cp -r build/android/res-overlay/java/. build/android/android/app/src/main/java/
           cp -r build/android/res-overlay/. build/android/android/app/src/main/res/
-
-          # The bulk cp above also copies res-overlay/java/ into res/java/ —
-          # Java sources must NOT live inside res/. Remove the stray copy.
           rm -rf build/android/android/app/src/main/res/java
-
-          # Remove Capacitor's default resources that conflict with / shadow
-          # the electerm overlay. These are generated by `cap add android` and
-          # must be deleted AFTER the overlay copy:
-          #   drawable-v24/ic_launcher_foreground.xml — vector foreground that
-          #     takes precedence over our density-specific foreground PNGs
-          #     on API 24+, showing the generic Capacitor logo instead of electerm.
-          #   values/ic_launcher_background.xml — same color name as our
-          #     colors-electerm.xml → duplicate-resource build error.
-          #   drawable*/splash.png — Capacitor ships splash.png in drawable/
-          #     AND in every density × orientation bucket (drawable-land-hdpi,
-          #     drawable-port-xxxhdpi, …).  Our splash is drawable/splash.xml
-          #     (a layer-list).  Android resource resolution prefers a
-          #     density/orientation-specific splash.png over the default-density
-          #     splash.xml, so on high-density phones (e.g. Huawei Mate 40 Pro
-          #     = xxxhdpi portrait) the Capacitor plug icon was shown instead
-          #     of the electerm splash.  Remove ALL of them.
-          # NOTE: ic_launcher_round.* are NOT removed — the overlay provides
-          # electerm round icons (referenced by android:roundIcon) that
-          # overwrite Capacitor's defaults during the copy above.
           RES=build/android/android/app/src/main/res
           rm -f "$RES/drawable-v24/ic_launcher_foreground.xml"
           rm -f "$RES/values/ic_launcher_background.xml"
           find "$RES" -type f -name 'splash.png' -path '*/drawable*' -delete
 
-      - name: Configure per-ABI APK splits
-        # Produce one APK per architecture (arm64-v8a, armeabi-v7a, x86_64)
-        # plus a universal build, instead of a single ~160MB universal blob.
-        # The second `android { }` block is cumulative with Capacitor's
-        # template app/build.gradle; output renaming is done post-build in
-        # shell to avoid AGP-version-specific output-name APIs.
+      - name: Build debug APK
         run: |
-          GRADLE=build/android/android/app/build.gradle
-          grep -q 'splits' "$GRADLE" || printf '%s\n' \
-            '' \
-            '// electerm: split per ABI (injected by CI)' \
-            'android {' \
-            '    splits {' \
-            '        abi {' \
-            '            enable true' \
-            '            reset()' \
-            "            include 'arm64-v8a', 'armeabi-v7a', 'x86_64'" \
-            '            universalApk true' \
-            '        }' \
-            '    }' \
-            '}' >> "$GRADLE"
-          tail -n 15 "$GRADLE"
+          cd build/android/android
+          chmod +x gradlew
+          ./gradlew assembleDebug
 
-      - name: Cache Gradle distribution
-        # The Gradle wrapper downloads gradle-8.14.3-all.zip (~150 MB) from
-        # services.gradle.org on every run. If that download fails with a
-        # transient network error (e.g. "Unexpected end of file from server"),
-        # the entire build fails. Caching the extracted distribution avoids
-        # the download entirely on subsequent runs.
-        uses: actions/cache@v4
-        with:
-          path: ~/.gradle/wrapper/dists
-          key: gradle-wrapper-${{ runner.os }}-${{ hashFiles('build/android/android/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-wrapper-${{ runner.os }}-
-
-      - name: Build release APK (signed with persistent keystore)
-        env:
-          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
-          ANDROID_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
-          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
-          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+      - name: Prepare APK
         run: |
-          cd build/android/android && chmod +x gradlew
-          KEYSTORE="$PWD/app/release.keystore"
-          printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
-          keytool -list -keystore "$KEYSTORE" -storepass "$ANDROID_RELEASE_KEYSTORE_PASSWORD"
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file="$KEYSTORE" \
-            -Pandroid.injected.signing.store.password="$ANDROID_RELEASE_KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$ANDROID_RELEASE_KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$ANDROID_RELEASE_KEY_PASSWORD"
+          mkdir -p out
+          cp build/android/android/app/build/outputs/apk/debug/app-debug.apk out/electerm-android-lan-gateway.apk
+          sha256sum out/electerm-android-lan-gateway.apk > out/SHA256SUMS.txt
 
-      - name: Rename APKs to electerm-android-{arch}-{version}.apk
-        # Version comes from package.json. Each per-ABI release APK is renamed
-        # to electerm-android-{arch}-{version}.apk. The {arch} is parsed from
-        # gradle's per-ABI output filename; falls back to "universal" for the
-        # universal build (or if splits are off).
-        id: rename
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          APKROOT=build/android/android/app/build/outputs/apk
-          mkdir -p "$APKROOT/named"
-          dir="$APKROOT/release"
-          for apk in "$dir"/*.apk; do
-            [ -f "$apk" ] || continue
-            name=$(basename "$apk")
-            arch=$(printf '%s' "$name" | grep -oE 'arm64-v8a|armeabi-v7a|x86_64|universal' | head -1)
-            [ -z "$arch" ] && arch=universal
-            out="electerm-android-$arch-$VERSION.apk"
-            cp "$apk" "$APKROOT/named/$out"
-            echo "  release/$name -> named/$out"
-          done
-          echo "=== named APKs ==="
-          ls -la "$APKROOT/named/"
-
-      - name: Upload APKs (artifact)
-        if: ${{ contains(github.event.head_commit.message, '[debug]') }}
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: electerm-android-apks
-          path: build/android/android/app/build/outputs/apk/named/*.apk
+          name: electerm-android-lan-gateway
+          path: out/*
           if-no-files-found: error
           retention-days: 30
-
-      - name: Delete existing release + tag (if re-run for same version)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.rename.outputs.version }}
-        run: |
-          TAG="v${VERSION}"
-          echo "Checking for existing release/tag: $TAG"
-          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
-
-      - name: Create draft release and upload APK assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.rename.outputs.version }}
-        run: |
-          TAG="v${VERSION}"
-          APKROOT=build/android/android/app/build/outputs/apk/named
-
-          # Release body with the electerm link list.
-          cat > /tmp/release-notes.md <<'EOF'
-          ## electerm for Android v${VERSION}
-
-          Download the APK that matches your device architecture:
-          - `arm64-v8a` — most modern Android phones/tablets (64-bit ARM)
-          - `armeabi-v7a` — older 32-bit ARM devices
-          - `x86_64` — Android emulators / Intel tablets
-          - `universal` — works on all architectures (larger download)
-
-          > **Note:** Local terminal and serial port are not available on Android
-          > yet (the required native libraries can not be built for Android at the
-          > moment). There is potential to add them in the future. SSH, SFTP,
-          > Telnet, FTP, RDP, VNC and Spice work because they are pure-JS / WASM
-          > network protocols.
-
-          ## Links
-
-          - [electerm.org](https://electerm.org): Homepage, downloads, videos, etc
-          - [electerm-web](https://github.com/electerm/electerm-web): Web app version running in browser(including mobile device)
-          - [electerm-web-docker](https://github.com/electerm/electerm-web-docker): Docker image for electerm-web
-          - [electerm online](https://cloud.electerm.org): Public free online electerm app
-          - [electerm demo](https://demo.electerm.org): Online demo of electerm
-          - [electerm AI](https://ai.electerm.org): Free AI for electerm users
-          - [electerm deb repo](https://repos.electerm.org/deb): Debian repo of electerm
-          - [electerm rpm repo](https://repos.electerm.org/rpm): RPM repo of electerm
-          EOF
-
-          # Substitute the version placeholder (heredoc above is literal).
-          sed -i "s/\${VERSION}/${VERSION}/g" /tmp/release-notes.md
-
-          # Collect release APKs.
-          RELEASE_APKS=("$APKROOT"/*.apk)
-
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "electerm-android v${VERSION}" \
-            --notes-file /tmp/release-notes.md \
-            --draft \
-            "${RELEASE_APKS[@]}"
-
-      - name: Publish the release
-        # IMPORTANT: must use a PAT (PAT_REPO_TOKEN), NOT the default
-        # github.token / GITHUB_TOKEN. Events triggered by GITHUB_TOKEN
-        # (except workflow_dispatch / repository_dispatch) do NOT spawn
-        # new workflow runs — see GitHub docs:
-        # https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
-        # The release: [published] event fired here is what wakes up:
-        #   - build-homepage-trigger.yml   (refreshes electerm.org)
-        #   - upload-release-assets-r1.yml (mirrors APKs to R2/r1)
-        # With GITHUB_TOKEN those downstream workflows stay silent.
-        env:
-          GH_TOKEN: ${{ secrets.PAT_REPO_TOKEN }}
-          VERSION: ${{ steps.rename.outputs.version }}
-        run: |
-          TAG="v${VERSION}"
-          gh release edit "$TAG" \
-            --repo "${{ github.repository }}" \
-            --draft=false
-          echo "Release $TAG published."
